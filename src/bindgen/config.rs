@@ -742,6 +742,11 @@ pub struct ParseExpandConfig {
     pub features: Option<Vec<String>>,
     /// Controls whether or not to pass `--release` when expanding.
     pub profile: Profile,
+    /// Resolve exported `_raw` function signatures through rustc MIR after macro expansion.
+    /// This replaces associated type projections with their concrete ABI types.
+    pub normalize_abi: bool,
+    /// Permit rustc's unstable `-Zunpretty` option on a stable toolchain.
+    pub bootstrap: bool,
 }
 
 impl Default for ParseExpandConfig {
@@ -752,6 +757,8 @@ impl Default for ParseExpandConfig {
             default_features: true,
             features: None,
             profile: Profile::Debug,
+            normalize_abi: false,
+            bootstrap: false,
         }
     }
 }
@@ -784,6 +791,8 @@ fn retrocomp_parse_expand_config_deserialize<'de, D: Deserializer<'de>>(
                 default_features: true,
                 features: None,
                 profile: Profile::Debug,
+                normalize_abi: false,
+                bootstrap: false,
             })
         }
 
@@ -823,6 +832,8 @@ pub struct ParseConfig {
     /// List of crate names which generate consts, statics, and fns. By default
     /// no dependent crates generate them.
     pub extra_bindings: Vec<String>,
+    /// Omit imported extern declarations and emit only exported definitions.
+    pub exported_only: bool,
 }
 
 impl ParseConfig {

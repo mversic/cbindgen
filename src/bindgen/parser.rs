@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path as FilePath, PathBuf as FilePathBuf};
@@ -15,8 +15,9 @@ use crate::bindgen::cargo::{Cargo, PackageRef};
 use crate::bindgen::config::{Config, ParseConfig};
 use crate::bindgen::error::Error;
 use crate::bindgen::ir::{
-    AnnotationSet, AnnotationValue, AssocTypeId, Cfg, Constant, Documentation, Enum, Function,
-    GenericParam, GenericParams, ItemMap, OpaqueItem, Path, Static, Struct, Type, Typedef, Union,
+    AnnotationSet, AnnotationValue, AssocTypeId, BlanketAssocType, Cfg, Constant, Documentation,
+    Enum, Function, GenericParam, GenericParams, ItemMap, Literal, OpaqueItem, Path, Static,
+    Struct, Type, Typedef, Union,
 };
 use crate::bindgen::utilities::{SynAbiHelpers, SynAttributeHelpers, SynItemHelpers};
 
@@ -28,6 +29,54 @@ const STD_CRATES: &[&str] = &[
     "core",
     "proc_macro",
 ];
+
+fn parse_mir_signatures(mir: &str) -> HashMap<String, VecDeque<syn::Signature>> {
+    let mut signatures: HashMap<String, VecDeque<syn::Signature>> = HashMap::new();
+    for line in mir.lines().map(str::trim) {
+        if !line.starts_with("fn ") || !line.ends_with('{') {
+            continue;
+        }
+        let Some(open_paren) = line.find('(') else {
+            continue;
+        };
+        let name = line[3..open_paren].rsplit("::").next().unwrap();
+        if !name.ends_with("_raw") {
+            continue;
+        }
+        let signature = format!(
+            "fn {}{}",
+            name,
+            line[open_paren..].trim_end_matches('{').trim()
+        );
+        if let Ok(signature) = syn::parse_str::<syn::Signature>(&signature) {
+            signatures
+                .entry(name.to_owned())
+                .or_default()
+                .push_back(signature);
+        }
+    }
+    signatures
+}
+
+fn with_normalized_types(
+    source: &syn::Signature,
+    normalized: &syn::Signature,
+) -> Option<syn::Signature> {
+    if source.inputs.len() != normalized.inputs.len() {
+        return None;
+    }
+    let mut result = source.clone();
+    for (source_arg, normalized_arg) in result.inputs.iter_mut().zip(&normalized.inputs) {
+        let (syn::FnArg::Typed(source_arg), syn::FnArg::Typed(normalized_arg)) =
+            (source_arg, normalized_arg)
+        else {
+            return None;
+        };
+        source_arg.ty = normalized_arg.ty.clone();
+    }
+    result.output = normalized.output.clone();
+    Some(result)
+}
 
 type ParseResult = Result<Parse, Error>;
 
@@ -196,6 +245,23 @@ impl Parser<'_> {
     fn parse_expand_crate(&mut self, pkg: &PackageRef) -> Result<(), Error> {
         assert!(self.lib.is_some());
 
+        if self.config.parse.expand.normalize_abi {
+            let mir = self
+                .lib
+                .as_ref()
+                .unwrap()
+                .expand_mir_crate(
+                    pkg,
+                    self.config.parse.expand.all_features,
+                    self.config.parse.expand.default_features,
+                    &self.config.parse.expand.features,
+                    self.config.parse.expand.profile,
+                    self.config.parse.expand.bootstrap,
+                )
+                .map_err(|x| Error::CargoExpand(pkg.name.clone(), x))?;
+            self.out.normalized_signatures = parse_mir_signatures(&mir);
+        }
+
         let mod_items = {
             if !self.cache_expanded_crate.contains_key(&pkg.name) {
                 let s = self
@@ -208,6 +274,7 @@ impl Parser<'_> {
                         self.config.parse.expand.default_features,
                         &self.config.parse.expand.features,
                         self.config.parse.expand.profile,
+                        self.config.parse.expand.bootstrap,
                     )
                     .map_err(|x| Error::CargoExpand(pkg.name.clone(), x))?;
                 let i = syn::parse_file(&s).map_err(|x| Error::ParseSyntaxError {
@@ -221,10 +288,22 @@ impl Parser<'_> {
             self.cache_expanded_crate.get(&pkg.name).unwrap().clone()
         };
 
-        self.process_mod(
+        self.out.normalizing_abi = self.config.parse.expand.normalize_abi;
+        let result = self.process_mod(
             pkg, None, None, &mod_items, 0, /* is_mod_rs = */ true,
             /* is_inline = */ false,
-        )
+        );
+        self.out.normalizing_abi = false;
+        self.out.normalized_signatures.clear();
+        result?;
+        if self.out.missing_normalized.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::AbiNormalization(
+                pkg.name.clone(),
+                std::mem::take(&mut self.out.missing_normalized),
+            ))
+        }
     }
 
     fn parse_mod(
@@ -413,6 +492,7 @@ pub struct Parse {
     pub constants: ItemMap<Constant>,
     pub globals: ItemMap<Static>,
     pub enums: ItemMap<Enum>,
+    pub enum_discriminants: HashMap<(Path, String), i128>,
     pub structs: ItemMap<Struct>,
     pub unions: ItemMap<Union>,
     pub opaque_items: ItemMap<OpaqueItem>,
@@ -421,6 +501,11 @@ pub struct Parse {
     pub source_files: Vec<FilePathBuf>,
     pub package_version: String,
     pub assoc_types: HashMap<AssocTypeId, (Type, u8)>,
+    pub reexports: HashMap<Path, Path>,
+    pub blanket_assoc_types: Vec<BlanketAssocType>,
+    normalized_signatures: HashMap<String, VecDeque<syn::Signature>>,
+    normalizing_abi: bool,
+    missing_normalized: Vec<String>,
     // If A depends on B e.g. impl trait for A{ type inner = B }
     // Key is B, Value is all A's
     pending_assoc_types: HashMap<AssocTypeId, Vec<AssocTypeId>>,
@@ -432,6 +517,7 @@ impl Parse {
             constants: ItemMap::default(),
             globals: ItemMap::default(),
             enums: ItemMap::default(),
+            enum_discriminants: HashMap::new(),
             structs: ItemMap::default(),
             unions: ItemMap::default(),
             opaque_items: ItemMap::default(),
@@ -440,6 +526,11 @@ impl Parse {
             source_files: Vec::new(),
             package_version: String::new(),
             assoc_types: HashMap::new(),
+            reexports: HashMap::new(),
+            blanket_assoc_types: Vec::new(),
+            normalized_signatures: HashMap::new(),
+            normalizing_abi: false,
+            missing_normalized: Vec::new(),
             pending_assoc_types: HashMap::new(),
         }
     }
@@ -483,6 +574,8 @@ impl Parse {
         self.constants.extend_with(&other.constants);
         self.globals.extend_with(&other.globals);
         self.enums.extend_with(&other.enums);
+        self.enum_discriminants
+            .extend(other.enum_discriminants.clone());
         self.structs.extend_with(&other.structs);
         self.unions.extend_with(&other.unions);
         self.opaque_items.extend_with(&other.opaque_items);
@@ -491,6 +584,9 @@ impl Parse {
         self.source_files.extend_from_slice(&other.source_files);
         self.package_version.clone_from(&other.package_version);
         self.assoc_types.clone_from(&other.assoc_types);
+        self.reexports.extend(other.reexports.clone());
+        self.blanket_assoc_types
+            .extend_from_slice(&other.blanket_assoc_types);
     }
 
     fn load_syn_crate_mod<'a>(
@@ -522,7 +618,23 @@ impl Parse {
                     self.load_syn_fn(config, binding_crate_name, crate_name, mod_cfg, item);
                 }
                 syn::Item::Const(ref item) => {
-                    self.load_syn_const(config, binding_crate_name, crate_name, mod_cfg, item);
+                    if item.ident == "_" {
+                        if let syn::Expr::Block(block) = &*item.expr {
+                            for stmt in &block.block.stmts {
+                                if let syn::Stmt::Item(nested) = stmt {
+                                    nested_modules.extend(self.load_syn_crate_mod(
+                                        config,
+                                        binding_crate_name,
+                                        crate_name,
+                                        mod_cfg,
+                                        std::slice::from_ref(nested),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        self.load_syn_const(config, binding_crate_name, crate_name, mod_cfg, item);
+                    }
                 }
                 syn::Item::Static(ref item) => {
                     self.load_syn_static(config, binding_crate_name, crate_name, mod_cfg, item);
@@ -538,6 +650,26 @@ impl Parse {
                 }
                 syn::Item::Type(ref item) => {
                     self.load_syn_ty(crate_name, mod_cfg, item);
+                }
+                syn::Item::Use(ref item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    fn collect_reexports(tree: &syn::UseTree, out: &mut HashMap<Path, Path>) {
+                        match tree {
+                            syn::UseTree::Rename(rename) => {
+                                out.insert(
+                                    Path::new(rename.rename.unraw().to_string()),
+                                    Path::new(rename.ident.unraw().to_string()),
+                                );
+                            }
+                            syn::UseTree::Path(path) => collect_reexports(&path.tree, out),
+                            syn::UseTree::Group(group) => {
+                                for tree in &group.items {
+                                    collect_reexports(tree, out);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    collect_reexports(&item.tree, &mut self.reexports);
                 }
                 syn::Item::Impl(ref item_impl) => {
                     let has_assoc_const = item_impl
@@ -588,6 +720,16 @@ impl Parse {
     }
 
     fn load_syn_impl(&mut self, item_impl: &syn::ItemImpl) {
+        let params: Vec<Path> = item_impl
+            .generics
+            .params
+            .iter()
+            .filter_map(|param| match param {
+                syn::GenericParam::Type(param) => Some(Path::new(param.ident.to_string())),
+                syn::GenericParam::Const(param) => Some(Path::new(param.ident.to_string())),
+                syn::GenericParam::Lifetime(_) => None,
+            })
+            .collect();
         let trait_ = if let Some((path, _)) = &item_impl.trait_ {
             Path::new(path.segments.last().unwrap().ident.to_string())
         } else {
@@ -634,6 +776,15 @@ impl Parse {
                 } else {
                     continue;
                 };
+
+                if !params.is_empty() {
+                    self.blanket_assoc_types.push(BlanketAssocType {
+                        pattern: key,
+                        value: conc_type,
+                        params: params.clone(),
+                    });
+                    continue;
+                }
 
                 // Check if concrete type is another associated type
                 let output = Parse::find_dependings_assoc_types(&self.assoc_types, &mut conc_type);
@@ -776,6 +927,9 @@ impl Parse {
         mod_cfg: Option<&Cfg>,
         item: &syn::ItemForeignMod,
     ) {
+        if config.parse.exported_only {
+            return;
+        }
         if !item.abi.is_c() && !item.abi.is_omitted() {
             info!("Skip {crate_name} - (extern block must be extern C).");
             return;
@@ -901,7 +1055,25 @@ impl Parse {
         match (is_extern_c, exported_name) {
             (true, Some(exported_name)) => {
                 let path = Path::new(exported_name);
-                match Function::load(path, self_type, sig, false, attrs, mod_cfg) {
+                let normalized = if self.normalizing_abi && sig.ident.to_string().ends_with("_raw")
+                {
+                    self.normalized_signatures
+                        .get_mut(&sig.ident.to_string())
+                        .and_then(VecDeque::pop_front)
+                } else {
+                    None
+                };
+                let abi_sig = normalized
+                    .as_ref()
+                    .and_then(|normalized| with_normalized_types(sig, normalized));
+                if self.normalizing_abi
+                    && sig.ident.to_string().ends_with("_raw")
+                    && abi_sig.is_none()
+                {
+                    self.missing_normalized.push(path.to_string());
+                }
+                let abi_sig = abi_sig.as_ref().unwrap_or(sig);
+                match Function::load(path, self_type, abi_sig, false, attrs, mod_cfg) {
                     Ok(func) => {
                         info!("Take {}.", loggable_item_name());
                         self.functions.push(func);
@@ -1127,6 +1299,30 @@ impl Parse {
         mod_cfg: Option<&Cfg>,
         item: &syn::ItemEnum,
     ) {
+        if item
+            .variants
+            .iter()
+            .all(|variant| matches!(variant.fields, syn::Fields::Unit))
+        {
+            let path = Path::new(item.ident.unraw().to_string());
+            let mut next = Some(0i128);
+            for variant in &item.variants {
+                let discriminant = match &variant.discriminant {
+                    Some((_, expr)) => match Literal::load(expr) {
+                        Ok(Literal::Expr(value)) => value.parse::<i128>().ok(),
+                        _ => None,
+                    },
+                    None => next,
+                };
+                if let Some(discriminant) = discriminant {
+                    self.enum_discriminants.insert(
+                        (path.clone(), variant.ident.unraw().to_string()),
+                        discriminant,
+                    );
+                }
+                next = discriminant.and_then(|value| value.checked_add(1));
+            }
+        }
         match Enum::load(item, mod_cfg, config) {
             Ok(en) => {
                 info!("Take {}::{}.", crate_name, item.ident);
@@ -1207,5 +1403,38 @@ impl Parse {
             }
         }
         self.load_syn_assoc_consts_from_impl(crate_name, mod_cfg, &impl_)
+    }
+}
+
+#[cfg(test)]
+mod normalized_signature_tests {
+    use super::{parse_mir_signatures, with_normalized_types};
+
+    #[test]
+    fn keeps_duplicate_method_names_in_mir_order() {
+        let mir = "fn _::_::drop_raw(_1: *mut Manager) -> () {\n\
+                   fn _::_::drop_raw(_1: *mut Battery) -> () {\n";
+        let mut signatures = parse_mir_signatures(mir);
+        let drops = signatures.get_mut("drop_raw").unwrap();
+        assert_eq!(drops.len(), 2);
+        let first = drops.pop_front().unwrap();
+        let second = drops.pop_front().unwrap();
+        assert!(quote::quote!(#first).to_string().contains("* mut Manager"));
+        assert!(quote::quote!(#second).to_string().contains("* mut Battery"));
+    }
+
+    #[test]
+    fn replaces_projected_types_and_preserves_argument_names() {
+        let source: syn::Signature = syn::parse_quote!(
+            fn next_raw(iterator: <Iterator as ReprC>::CType)
+                -> <Option<OwnedBattery> as ReprC>::CType
+        );
+        let mir: syn::Signature = syn::parse_quote!(
+            fn next_raw(_1: *mut Iterator) -> CBox<Battery>
+        );
+        let merged = with_normalized_types(&source, &mir).unwrap();
+        let printed = quote::quote!(#merged).to_string();
+        assert!(printed.contains("iterator : * mut Iterator"));
+        assert!(printed.contains("-> CBox < Battery >"));
     }
 }

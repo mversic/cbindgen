@@ -1,0 +1,11 @@
+{
+test_enum;
+test_struct_gen;
+test_union;
+test_typedefs;
+test_fn;
+test_func_ptr;
+test_raw_ptr;
+STATIC_TEST_1;
+STATIC_TEST_2;
+};

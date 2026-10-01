@@ -1,0 +1,4 @@
+{
+battery_get_state;
+battery_get_technology;
+};

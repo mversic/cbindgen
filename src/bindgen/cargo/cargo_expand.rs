@@ -73,9 +73,14 @@ pub fn expand(
     expand_default_features: bool,
     expand_features: &Option<Vec<String>>,
     profile: Profile,
+    unpretty: &str,
+    bootstrap: bool,
 ) -> Result<String, Error> {
     let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
     let mut cmd = Command::new(cargo);
+    if bootstrap {
+        cmd.env("RUSTC_BOOTSTRAP", "1");
+    }
 
     let mut _temp_dir = None; // drop guard
     if use_tempdir {
@@ -128,7 +133,7 @@ pub fn expand(
     cmd.arg(&package);
     cmd.arg("--verbose");
     cmd.arg("--");
-    cmd.arg("-Zunpretty=expanded");
+    cmd.arg(format!("-Zunpretty={unpretty}"));
     info!("Command: {cmd:?}");
     let output = cmd.output()?;
 

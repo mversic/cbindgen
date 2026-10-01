@@ -420,14 +420,17 @@ impl Builder {
             result.constants,
             result.globals,
             result.enums,
+            result.enum_discriminants,
             result.structs,
             result.unions,
             result.opaque_items,
             result.typedefs,
+            result.reexports,
             result.functions,
             result.source_files,
             result.package_version,
             assoc_types,
+            result.blanket_assoc_types,
         )
         .generate()
     }

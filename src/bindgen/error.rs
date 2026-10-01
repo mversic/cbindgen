@@ -16,6 +16,7 @@ pub enum Error {
     CargoMetadata(String, CargoMetadataError),
     CargoToml(String, CargoTomlError),
     CargoExpand(String, CargoExpandError),
+    AbiNormalization(String, Vec<String>),
     ParseSyntaxError {
         crate_name: String,
         src_path: String,
@@ -39,17 +40,19 @@ impl fmt::Display for Error {
             }
             Error::CargoExpand(ref crate_name, ref error) => write!(
                 f,
-                "Parsing crate `{crate_name}`: couldn't run `cargo rustc -Zunpretty=expanded`: {error:?}"
+                "Parsing crate `{crate_name}`: couldn't run `cargo rustc -Zunpretty`: {error:?}"
+            ),
+            Error::AbiNormalization(ref crate_name, ref names) => write!(
+                f,
+                "Parsing crate `{crate_name}`: couldn't normalize ABI signatures for {}",
+                names.join(", ")
             ),
             Error::ParseSyntaxError {
                 ref crate_name,
                 ref src_path,
                 ref error,
             } => {
-                write!(
-                    f,
-                    "Parsing crate `{crate_name}`:`{src_path}`:\n{error:?}"
-                )?;
+                write!(f, "Parsing crate `{crate_name}`:`{src_path}`:\n{error:?}")?;
 
                 if !src_path.is_empty() {
                     write!(
@@ -76,6 +79,7 @@ impl error::Error for Error {
             Error::CargoMetadata(_, ref error) => Some(error),
             Error::CargoToml(_, ref error) => Some(error),
             Error::CargoExpand(_, ref error) => Some(error),
+            Error::AbiNormalization(..) => None,
             Error::ParseSyntaxError { ref error, .. } => Some(error),
             Error::ParseCannotOpenFile { .. } => None,
         }

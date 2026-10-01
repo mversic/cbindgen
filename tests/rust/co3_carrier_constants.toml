@@ -1,0 +1,15 @@
+language = "C"
+usize_is_size_t = true
+
+[parse]
+exported_only = true
+
+[struct]
+rename_associated_constant = "UpperCase"
+
+[export.mangle]
+remove_underscores = true
+
+[export.rename]
+CState = "State"
+CTechnology = "Technology"

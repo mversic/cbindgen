@@ -240,6 +240,7 @@ impl Cargo {
         expand_default_features: bool,
         expand_features: &Option<Vec<String>>,
         profile: Profile,
+        bootstrap: bool,
     ) -> Result<String, cargo_expand::Error> {
         cargo_expand::expand(
             &self.manifest_path,
@@ -250,6 +251,31 @@ impl Cargo {
             expand_default_features,
             expand_features,
             profile,
+            "expanded",
+            bootstrap,
+        )
+    }
+
+    pub(crate) fn expand_mir_crate(
+        &self,
+        package: &PackageRef,
+        expand_all_features: bool,
+        expand_default_features: bool,
+        expand_features: &Option<Vec<String>>,
+        profile: Profile,
+        bootstrap: bool,
+    ) -> Result<String, cargo_expand::Error> {
+        cargo_expand::expand(
+            &self.manifest_path,
+            &package.name,
+            package.version.as_deref(),
+            self.clean,
+            expand_all_features,
+            expand_default_features,
+            expand_features,
+            profile,
+            "mir",
+            bootstrap,
         )
     }
 }

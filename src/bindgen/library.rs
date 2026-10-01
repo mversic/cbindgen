@@ -11,7 +11,8 @@ use crate::bindgen::declarationtyperesolver::DeclarationTypeResolver;
 use crate::bindgen::dependencies::Dependencies;
 use crate::bindgen::error::Error;
 use crate::bindgen::ir::{
-    AssocTypeId, Constant, Enum, Function, Item, ItemContainer, ItemMap, Type,
+    AssocTypeId, AssocTypeResolver, BlanketAssocType, Constant, Enum, Function, Item,
+    ItemContainer, ItemMap, Type,
 };
 use crate::bindgen::ir::{OpaqueItem, Path, Static, Struct, Typedef, Union};
 use crate::bindgen::monomorph::Monomorphs;
@@ -23,14 +24,17 @@ pub struct Library {
     constants: ItemMap<Constant>,
     globals: ItemMap<Static>,
     enums: ItemMap<Enum>,
+    enum_discriminants: HashMap<(Path, String), i128>,
     structs: ItemMap<Struct>,
     unions: ItemMap<Union>,
     opaque_items: ItemMap<OpaqueItem>,
     typedefs: ItemMap<Typedef>,
+    reexports: HashMap<Path, Path>,
     functions: Vec<Function>,
     source_files: Vec<PathBuf>,
     package_version: String,
     assoc_types: HashMap<AssocTypeId, Type>,
+    blanket_assoc_types: Vec<BlanketAssocType>,
 }
 
 impl Library {
@@ -40,28 +44,39 @@ impl Library {
         constants: ItemMap<Constant>,
         globals: ItemMap<Static>,
         enums: ItemMap<Enum>,
+        enum_discriminants: HashMap<(Path, String), i128>,
         structs: ItemMap<Struct>,
         unions: ItemMap<Union>,
         opaque_items: ItemMap<OpaqueItem>,
         typedefs: ItemMap<Typedef>,
+        reexports: HashMap<Path, Path>,
         functions: Vec<Function>,
         source_files: Vec<PathBuf>,
         package_version: String,
         assoc_types: HashMap<AssocTypeId, Type>,
+        blanket_assoc_types: Vec<BlanketAssocType>,
     ) -> Library {
+        let mut config = config;
+        for (alias, original) in &reexports {
+            config.export.rename.entry(alias.name().to_owned())
+                .or_insert_with(|| original.name().to_owned());
+        }
         Library {
             config,
             constants,
             globals,
             enums,
+            enum_discriminants,
             structs,
             unions,
             opaque_items,
             typedefs,
+            reexports,
             functions,
             source_files,
             package_version,
             assoc_types,
+            blanket_assoc_types,
         }
     }
 
@@ -85,6 +100,7 @@ impl Library {
         }
 
         self.rename_items();
+        self.inline_integer_enum_casts();
 
         let mut dependencies = Dependencies::new();
 
@@ -173,7 +189,28 @@ impl Library {
         find!(opaque_items, OpaqueItems);
         find!(typedefs, Typedefs);
 
+        if let Some(original) = self.reexports.get(p) {
+            if original != p {
+                return self.get_items(original);
+            }
+        }
+
         None
+    }
+
+    fn inline_integer_enum_casts(&mut self) {
+        self.constants.for_all_items_mut(|constant| {
+            constant
+                .value
+                .inline_integer_enum_casts(&self.enum_discriminants);
+        });
+        self.structs.for_all_items_mut(|structure| {
+            for constant in &mut structure.associated_constants {
+                constant
+                    .value
+                    .inline_integer_enum_casts(&self.enum_discriminants);
+            }
+        });
     }
 
     pub fn get_config(&self) -> &Config {
@@ -453,7 +490,10 @@ impl Library {
 
     // Replace all associated types with concrete types
     fn replace_assoc_types(&mut self) {
-        let assoc_map = &self.assoc_types;
+        let assoc_map = &AssocTypeResolver {
+            exact: self.assoc_types.clone(),
+            blanket: self.blanket_assoc_types.clone(),
+        };
 
         self.constants.for_all_items_mut(|const_| {
             const_.resolve_assoc_types(assoc_map);

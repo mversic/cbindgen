@@ -251,6 +251,46 @@ pub enum Literal {
 }
 
 impl Literal {
+    /// Inline known enum discriminants in integer casts, so a carrier
+    /// constant does not require the source enum in the generated header.
+    pub(crate) fn inline_integer_enum_casts(&mut self, values: &HashMap<(Path, String), i128>) {
+        match self {
+            Literal::Cast { ty, value }
+                if matches!(ty, Type::Primitive(PrimitiveType::Integer { .. })) =>
+            {
+                if let Literal::Path {
+                    associated_to: Some((path, _)),
+                    name,
+                } = value.as_ref()
+                {
+                    if let Some(discriminant) = values.get(&(path.clone(), name.clone())) {
+                        **value = Literal::Expr(discriminant.to_string());
+                        return;
+                    }
+                }
+                value.inline_integer_enum_casts(values);
+            }
+            Literal::Cast { value, .. }
+            | Literal::PostfixUnaryOp { value, .. }
+            | Literal::FieldAccess { base: value, .. } => value.inline_integer_enum_casts(values),
+            Literal::BinOp { left, right, .. } => {
+                left.inline_integer_enum_casts(values);
+                right.inline_integer_enum_casts(values);
+            }
+            Literal::Struct { fields, .. } => {
+                for field in fields.values_mut() {
+                    field.value.inline_integer_enum_casts(values);
+                }
+            }
+            Literal::Array { items } => {
+                for item in items {
+                    item.inline_integer_enum_casts(values);
+                }
+            }
+            Literal::Expr(..) | Literal::Path { .. } => {}
+        }
+    }
+
     pub fn add_dependencies(&self, library: &Library, out: &mut Dependencies) {
         self.visit(&mut |lit| {
             match lit {
