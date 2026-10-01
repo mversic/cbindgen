@@ -20,6 +20,14 @@ pub struct AssocTypeId {
 }
 
 impl AssocTypeId {
+    pub fn specialize(&self, mappings: &[(&Path, &GenericArgument)]) -> Self {
+        Self {
+            ty: Box::new(self.ty.specialize(mappings)),
+            trait_: self.trait_.clone(),
+            ident: self.ident.clone(),
+        }
+    }
+
     pub fn load(path: &syn::Path, qself: &syn::QSelf) -> Result<Self, String> {
         let self_type = &qself.ty;
 
@@ -280,7 +288,7 @@ pub struct GenericPath {
     export_name: String,
     generics: Vec<GenericArgument>,
     ctype: Option<DeclarationType>,
-    assoc: Option<AssocTypeId>,
+    pub(crate) assoc: Option<AssocTypeId>,
 }
 
 impl GenericPath {

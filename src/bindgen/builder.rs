@@ -428,6 +428,7 @@ impl Builder {
             result.source_files,
             result.package_version,
             assoc_types,
+            result.blanket_assoc_types,
         )
         .generate()
     }

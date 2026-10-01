@@ -15,8 +15,9 @@ use crate::bindgen::cargo::{Cargo, PackageRef};
 use crate::bindgen::config::{Config, ParseConfig};
 use crate::bindgen::error::Error;
 use crate::bindgen::ir::{
-    AnnotationSet, AnnotationValue, AssocTypeId, Cfg, Constant, Documentation, Enum, Function,
-    GenericParam, GenericParams, ItemMap, OpaqueItem, Path, Static, Struct, Type, Typedef, Union,
+    AnnotationSet, AnnotationValue, AssocTypeId, BlanketAssocType, Cfg, Constant, Documentation,
+    Enum, Function, GenericParam, GenericParams, ItemMap, OpaqueItem, Path, Static, Struct, Type,
+    Typedef, Union,
 };
 use crate::bindgen::utilities::{SynAbiHelpers, SynAttributeHelpers, SynItemHelpers};
 
@@ -421,6 +422,7 @@ pub struct Parse {
     pub source_files: Vec<FilePathBuf>,
     pub package_version: String,
     pub assoc_types: HashMap<AssocTypeId, (Type, u8)>,
+    pub blanket_assoc_types: Vec<BlanketAssocType>,
     // If A depends on B e.g. impl trait for A{ type inner = B }
     // Key is B, Value is all A's
     pending_assoc_types: HashMap<AssocTypeId, Vec<AssocTypeId>>,
@@ -440,6 +442,7 @@ impl Parse {
             source_files: Vec::new(),
             package_version: String::new(),
             assoc_types: HashMap::new(),
+            blanket_assoc_types: Vec::new(),
             pending_assoc_types: HashMap::new(),
         }
     }
@@ -491,6 +494,8 @@ impl Parse {
         self.source_files.extend_from_slice(&other.source_files);
         self.package_version.clone_from(&other.package_version);
         self.assoc_types.clone_from(&other.assoc_types);
+        self.blanket_assoc_types
+            .extend_from_slice(&other.blanket_assoc_types);
     }
 
     fn load_syn_crate_mod<'a>(
@@ -522,7 +527,23 @@ impl Parse {
                     self.load_syn_fn(config, binding_crate_name, crate_name, mod_cfg, item);
                 }
                 syn::Item::Const(ref item) => {
-                    self.load_syn_const(config, binding_crate_name, crate_name, mod_cfg, item);
+                    if item.ident == "_" {
+                        if let syn::Expr::Block(block) = &*item.expr {
+                            for stmt in &block.block.stmts {
+                                if let syn::Stmt::Item(nested) = stmt {
+                                    nested_modules.extend(self.load_syn_crate_mod(
+                                        config,
+                                        binding_crate_name,
+                                        crate_name,
+                                        mod_cfg,
+                                        std::slice::from_ref(nested),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        self.load_syn_const(config, binding_crate_name, crate_name, mod_cfg, item);
+                    }
                 }
                 syn::Item::Static(ref item) => {
                     self.load_syn_static(config, binding_crate_name, crate_name, mod_cfg, item);
@@ -588,6 +609,16 @@ impl Parse {
     }
 
     fn load_syn_impl(&mut self, item_impl: &syn::ItemImpl) {
+        let params: Vec<Path> = item_impl
+            .generics
+            .params
+            .iter()
+            .filter_map(|param| match param {
+                syn::GenericParam::Type(param) => Some(Path::new(param.ident.to_string())),
+                syn::GenericParam::Const(param) => Some(Path::new(param.ident.to_string())),
+                syn::GenericParam::Lifetime(_) => None,
+            })
+            .collect();
         let trait_ = if let Some((path, _)) = &item_impl.trait_ {
             Path::new(path.segments.last().unwrap().ident.to_string())
         } else {
@@ -634,6 +665,15 @@ impl Parse {
                 } else {
                     continue;
                 };
+
+                if !params.is_empty() {
+                    self.blanket_assoc_types.push(BlanketAssocType {
+                        pattern: key,
+                        value: conc_type,
+                        params: params.clone(),
+                    });
+                    continue;
+                }
 
                 // Check if concrete type is another associated type
                 let output = Parse::find_dependings_assoc_types(&self.assoc_types, &mut conc_type);

@@ -11,7 +11,8 @@ use crate::bindgen::declarationtyperesolver::DeclarationTypeResolver;
 use crate::bindgen::dependencies::Dependencies;
 use crate::bindgen::error::Error;
 use crate::bindgen::ir::{
-    AssocTypeId, Constant, Enum, Function, Item, ItemContainer, ItemMap, Type,
+    AssocTypeId, AssocTypeResolver, BlanketAssocType, Constant, Enum, Function, Item,
+    ItemContainer, ItemMap, Type,
 };
 use crate::bindgen::ir::{OpaqueItem, Path, Static, Struct, Typedef, Union};
 use crate::bindgen::monomorph::Monomorphs;
@@ -31,6 +32,7 @@ pub struct Library {
     source_files: Vec<PathBuf>,
     package_version: String,
     assoc_types: HashMap<AssocTypeId, Type>,
+    blanket_assoc_types: Vec<BlanketAssocType>,
 }
 
 impl Library {
@@ -48,6 +50,7 @@ impl Library {
         source_files: Vec<PathBuf>,
         package_version: String,
         assoc_types: HashMap<AssocTypeId, Type>,
+        blanket_assoc_types: Vec<BlanketAssocType>,
     ) -> Library {
         Library {
             config,
@@ -62,6 +65,7 @@ impl Library {
             source_files,
             package_version,
             assoc_types,
+            blanket_assoc_types,
         }
     }
 
@@ -453,7 +457,10 @@ impl Library {
 
     // Replace all associated types with concrete types
     fn replace_assoc_types(&mut self) {
-        let assoc_map = &self.assoc_types;
+        let assoc_map = &AssocTypeResolver {
+            exact: self.assoc_types.clone(),
+            blanket: self.blanket_assoc_types.clone(),
+        };
 
         self.constants.for_all_items_mut(|const_| {
             const_.resolve_assoc_types(assoc_map);

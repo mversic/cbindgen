@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use syn::ext::IdentExt;
 
@@ -326,7 +326,144 @@ pub enum Type {
     },
 }
 
-pub type AssocTypeResolver = HashMap<AssocTypeId, Type>;
+#[derive(Debug, Clone)]
+pub struct BlanketAssocType {
+    pub pattern: AssocTypeId,
+    pub value: Type,
+    pub params: Vec<Path>,
+}
+
+pub struct AssocTypeResolver {
+    pub exact: HashMap<AssocTypeId, Type>,
+    pub blanket: Vec<BlanketAssocType>,
+}
+
+impl AssocTypeResolver {
+    pub fn get(&self, id: &AssocTypeId) -> Option<Type> {
+        if let Some(value) = self.exact.get(id) {
+            return Some(value.clone());
+        }
+        let mut matched = None;
+        for blanket in &self.blanket {
+            if blanket.pattern.trait_ != id.trait_ || blanket.pattern.ident != id.ident {
+                continue;
+            }
+            let mut bindings = HashMap::new();
+            if match_blanket_type(&blanket.pattern.ty, &id.ty, &blanket.params, &mut bindings) {
+                let mappings: Vec<_> = bindings.iter().map(|(name, value)| (name, value)).collect();
+                let value = blanket.value.specialize(&mappings);
+                if matched.as_ref().is_some_and(|previous| previous != &value) {
+                    warn!("{id:?}: ambiguous blanket associated type");
+                    return None;
+                }
+                matched = Some(value);
+            }
+        }
+        matched
+    }
+}
+
+fn match_blanket_argument(
+    pattern: &GenericArgument,
+    actual: &GenericArgument,
+    params: &[Path],
+    bindings: &mut HashMap<Path, GenericArgument>,
+) -> bool {
+    let variable = match pattern {
+        GenericArgument::Type(Type::Path(path)) if path.is_single_identifier() => Some(path.path()),
+        GenericArgument::Const(ConstExpr::Path(path)) if path.is_single_identifier() => {
+            Some(path.path())
+        }
+        _ => None,
+    };
+    if let Some(name) = variable.filter(|name| params.contains(name)) {
+        return match bindings.get(name) {
+            Some(bound) => bound == actual,
+            None => {
+                bindings.insert(name.clone(), actual.clone());
+                true
+            }
+        };
+    }
+    match (pattern, actual) {
+        (GenericArgument::Type(pattern), GenericArgument::Type(actual)) => {
+            match_blanket_type(pattern, actual, params, bindings)
+        }
+        _ => pattern == actual,
+    }
+}
+
+fn match_blanket_type(
+    pattern: &Type,
+    actual: &Type,
+    params: &[Path],
+    bindings: &mut HashMap<Path, GenericArgument>,
+) -> bool {
+    if let Type::Path(path) = pattern {
+        if path.is_single_identifier() && params.contains(path.path()) {
+            return match bindings.get(path.path()) {
+                Some(GenericArgument::Type(bound)) => bound == actual,
+                Some(GenericArgument::Const(_)) => false,
+                None => {
+                    bindings.insert(path.path().clone(), GenericArgument::Type(actual.clone()));
+                    true
+                }
+            };
+        }
+    }
+    match (pattern, actual) {
+        (Type::Path(pattern), Type::Path(actual)) => {
+            pattern.path() == actual.path()
+                && pattern.generics().len() == actual.generics().len()
+                && pattern
+                    .generics()
+                    .iter()
+                    .zip(actual.generics())
+                    .all(|(p, a)| match_blanket_argument(p, a, params, bindings))
+        }
+        (
+            Type::Ptr {
+                ty: p,
+                is_const: pc,
+                is_nullable: pn,
+                is_ref: pr,
+            },
+            Type::Ptr {
+                ty: a,
+                is_const: ac,
+                is_nullable: an,
+                is_ref: ar,
+            },
+        ) => pc == ac && pn == an && pr == ar && match_blanket_type(p, a, params, bindings),
+        (Type::Array(p, pn), Type::Array(a, an)) => {
+            pn == an && match_blanket_type(p, a, params, bindings)
+        }
+        (
+            Type::FuncPtr {
+                ret: p,
+                args: pa,
+                is_nullable: pn,
+                never_return: pr,
+            },
+            Type::FuncPtr {
+                ret: a,
+                args: aa,
+                is_nullable: an,
+                never_return: ar,
+            },
+        ) => {
+            pn == an
+                && pr == ar
+                && pa.len() == aa.len()
+                && match_blanket_type(p, a, params, bindings)
+                && pa
+                    .iter()
+                    .zip(aa)
+                    .all(|((_, p), (_, a))| match_blanket_type(p, a, params, bindings))
+        }
+        _ => pattern == actual,
+    }
+}
 
 impl Type {
     pub fn const_ref_to(ty: &Self) -> Self {
@@ -660,6 +797,8 @@ impl Type {
                         .map(|x| x.specialize(mappings))
                         .collect(),
                 );
+                let mut specialized = specialized;
+                specialized.assoc = generic_path.assoc().map(|id| id.specialize(mappings));
                 Type::Path(specialized)
             }
             Type::Primitive(ref primitive) => Type::Primitive(primitive.clone()),
@@ -865,27 +1004,44 @@ impl Type {
         }
     }
 
-    // Search and replace specific associated types with concrete types
+    // Search and replace specific associated types with concrete types.
     pub fn resolve_assoc_types(&mut self, resolver: &AssocTypeResolver) {
+        self.resolve_assoc_types_inner(resolver, &mut HashSet::new());
+    }
+
+    fn resolve_assoc_types_inner(
+        &mut self,
+        resolver: &AssocTypeResolver,
+        resolving: &mut HashSet<AssocTypeId>,
+    ) {
         match self {
-            Type::Ptr { ty: ty_, .. } => {
-                ty_.resolve_assoc_types(resolver);
-            }
-            Type::Array(ty_, _) => {
-                ty_.resolve_assoc_types(resolver);
+            Type::Ptr { ty, .. } | Type::Array(ty, _) => {
+                ty.resolve_assoc_types_inner(resolver, resolving);
             }
             Type::FuncPtr { ret, args, .. } => {
-                ret.resolve_assoc_types(resolver);
-                for (_, ty_) in args {
-                    ty_.resolve_assoc_types(resolver);
+                ret.resolve_assoc_types_inner(resolver, resolving);
+                for (_, ty) in args {
+                    ty.resolve_assoc_types_inner(resolver, resolving);
                 }
             }
-            Type::Path(generic_path) => {
-                if let Some(id) = generic_path.assoc() {
-                    if let Some(concrete) = resolver.get(id) {
-                        *self = concrete.clone();
+            Type::Path(path) => {
+                if let Some(id) = path.assoc().cloned() {
+                    if !resolving.insert(id.clone()) {
+                        warn!("{id:?}: cyclic associated type");
+                        return;
+                    }
+                    if let Some(concrete) = resolver.get(&id) {
+                        *self = concrete;
+                        self.resolve_assoc_types_inner(resolver, resolving);
                     } else {
                         warn!("{id:?}: Unknown associated type");
+                    }
+                    resolving.remove(&id);
+                } else {
+                    for arg in path.generics_mut() {
+                        if let GenericArgument::Type(ty) = arg {
+                            ty.resolve_assoc_types_inner(resolver, resolving);
+                        }
                     }
                 }
             }
